@@ -150,7 +150,7 @@ classification_prompt = """
   {"Category": "category_prediction"}
 """
 
-metadata_prompt = f"""
+metadata_prompt = """
 You are an intelligent assistant that extracts structured metadata from technical support queries.
 Analyze the query and extract the following information:
 
