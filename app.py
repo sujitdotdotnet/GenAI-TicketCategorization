@@ -1,146 +1,194 @@
-
-import streamlit as st
-import pandas as pd
 import json
 import os
+import re
+
+import streamlit as st
 from openai import OpenAI
 
-# Load OpenAI API key and base URL from Colab secrets
 try:
-    OPENAI_API_KEY = os.environ.get("API_KEY")
-    OPENAI_API_BASE = os.environ.get("API_BASE")
-    openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE)
-except Exception as e:
-    st.error(f"Error loading OpenAI credentials: {e}")
-    st.stop()
+    from dotenv import load_dotenv
+
+    load_dotenv()  # loads variables from a .env file in the working directory
+except ImportError:
+    pass  # python-dotenv not installed; real environment variables still work
+
+st.set_page_config(page_title="Support Ticket Categorization System")
+
+# ---------------------------------------------------------------------------
+# Provider configuration (all use OpenAI-compatible endpoints)
+# ---------------------------------------------------------------------------
+PROVIDERS = {
+    "OpenRouter": {
+        "env_var": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "openai/gpt-4o-mini",
+    },
+    "OpenAI": {
+        "env_var": "OPENAI_API_KEY",
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o-mini",
+    },
+    "Claude": {
+        "env_var": "ANTHROPIC_API_KEY",
+        "base_url": "https://api.anthropic.com/v1/",
+        "default_model": "claude-sonnet-5-5",
+    },
+    "Gemini": {
+        "env_var": "GEMINI_API_KEY",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "default_model": "gemini-2.5-flash",
+    },
+    "DeepSeek": {
+        "env_var": "DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com",
+        "default_model": "deepseek-chat",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Sidebar: instructions, provider, API key, model
+# ---------------------------------------------------------------------------
+st.sidebar.header("How to use")
+st.sidebar.markdown(
+    """
+1. Pick an **LLM provider**.
+2. Enter your **API key** for that provider  
+   (or leave it empty to use the key from your `.env` file).
+3. Paste a support ticket on the main page and click **Process Ticket**.
+
+The Base URL changes automatically with the provider.
+
+**`.env` fallback variables**
+- `OPENROUTER_API_KEY`
+- `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `GEMINI_API_KEY`
+- `DEEPSEEK_API_KEY`
+"""
+)
+st.sidebar.divider()
+st.sidebar.header("LLM Settings")
+
+provider = st.sidebar.selectbox("LLM provider", list(PROVIDERS.keys()))
+cfg = PROVIDERS[provider]
+
+# Base URL updates automatically with the provider (read-only display)
+st.sidebar.text_input("Base URL", value=cfg["base_url"], disabled=True, key=f"base_{provider}")
+
+# Separate widget keys per provider so each provider remembers its own key/model
+ui_key = st.sidebar.text_input(
+    f"API key for {provider}",
+    type="password",
+    placeholder="Leave empty to use the key from .env",
+    key=f"key_{provider}",
+)
+model_name = st.sidebar.text_input(
+    "Model", value=cfg["default_model"], key=f"model_{provider}"
+)
+
+# Key priority: value typed in the box -> fallback to .env / environment
+env_key = (os.environ.get(cfg["env_var"]) or "").strip()
+api_key = ui_key.strip() or env_key
+
+if ui_key.strip():
+    st.sidebar.success(f"Using the {provider} key entered above.")
+elif env_key:
+    st.sidebar.info(f"Using {cfg['env_var']} from .env.")
+else:
+    st.sidebar.error(
+        f"No API key found for {provider}. Add one in the box above "
+        f"or set {cfg['env_var']} in .env."
+    )
+
+MAX_TOKENS = 500
 
 
-# Define the functions for categorization, metadata extraction, priority prediction, and response generation
-def query_openai(prompt, query):
-    """
-    Queries the OpenAI model with a given prompt and query.
-    Args:
-        prompt (str): The prompt for the model.
-        query (str): The query to be answered by the model.
-    Returns:
-        str: The model's response.
-    """
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": query}
-    ]
-    response = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo",  # Or another suitable OpenAI model
-        messages=messages,
-        max_tokens=100  # Adjust max_tokens as needed
+def get_client():
+    """Build an OpenAI-compatible client for the selected provider."""
+    return OpenAI(api_key=api_key, base_url=cfg["base_url"])
+
+
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+def query_llm(prompt, query):
+    """Send a system prompt + user query to the selected provider and return text."""
+    response = get_client().chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": query},
+        ],
+        max_tokens=MAX_TOKENS,
     )
     return response.choices[0].message.content
 
-def classify_ticket(prompt, query):
-    """
-    Classifies a support ticket using the OpenAI model and returns the result in JSON format.
-    Args:
-        prompt (str): The classification prompt for the model.
-        query (str): The support ticket text to be classified.
-    Returns:
-        dict: A dictionary containing the classification result, or None if classification fails.
-    """
+
+def parse_json(text):
+    """Parse JSON from a model reply, tolerating ```json fences or extra text."""
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
     try:
-        response_text = query_openai(prompt, query)
-        # Attempt to parse the response text as JSON
-        classification_result = json.loads(response_text)
-        return classification_result
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise
+
+
+def run_json_task(prompt, query, label):
+    """Call the LLM and parse a JSON reply; show errors in the UI and return None on failure."""
+    response_text = ""
+    try:
+        response_text = query_llm(prompt, query)
+        return parse_json(response_text)
     except json.JSONDecodeError as e:
-        st.error(f"Error decoding JSON from OpenAI response: {e}")
-        st.text(f"Raw OpenAI response: {response_text}")
+        st.error(f"Error decoding JSON from model response ({label}): {e}")
+        st.text(f"Raw response: {response_text}")
         return None
     except Exception as e:
-        st.error(f"An unexpected error occurred during classification: {e}")
+        st.error(f"An unexpected error occurred during {label}: {e}")
         return None
+
+
+def classify_ticket(prompt, query):
+    return run_json_task(prompt, query, "classification")
+
 
 def extract_metadata(prompt, query):
-    """
-    Extracts metadata from a support ticket using the OpenAI model and returns the result in JSON format.
-    Args:
-        prompt (str): The metadata extraction prompt for the model.
-        query (str): The support ticket text to extract metadata from.
-    Returns:
-        dict: A dictionary containing the extracted metadata, or None if extraction fails.
-    """
-    try:
-        response_text = query_openai(prompt, query)
-        # Attempt to parse the response text as JSON
-        metadata_result = json.loads(response_text)
-        return metadata_result
-    except json.JSONDecodeError as e:
-        st.error(f"Error decoding JSON from OpenAI response: {e}")
-        st.text(f"Raw OpenAI response: {response_text}")
-        return None
-    except Exception as e:
-        st.error(f"An unexpected error occurred during metadata extraction: {e}")
-        return None
+    return run_json_task(prompt, query, "metadata extraction")
+
 
 def predict_priority(prompt, query, problem_type, user_impact):
+    full_query = f"""
+    Support Ticket: {query}
+    Problem Type: {problem_type}
+    User Impact: {user_impact}
+    Based on the support ticket, problem type, and user impact, predict the priority: Low, Medium, High, or Urgent.
+    Return only a structured JSON output in the following format:
+    {{"priority": "priority_prediction"}}
     """
-    Predicts the priority of a support ticket using the OpenAI model and returns the result in JSON format.
-    Args:
-        prompt (str): The priority prediction prompt for the model.
-        query (str): The support ticket text to predict the priority for.
-        problem_type (str): The extracted problem type.
-        user_impact (str): The extracted user impact.
-    Returns:
-        dict: A dictionary containing the predicted priority, or None if prediction fails.
-    """
-    try:
-        # Include problem_type and user_impact in the query sent to the model
-        full_query = f"""
-        Support Ticket: {query}
-        Problem Type: {problem_type}
-        User Impact: {user_impact}
-        Based on the support ticket, problem type, and user impact, predict the priority: Low, Medium, High, or Urgent.
-        Return only a structured JSON output in the following format:
-        {{"priority": "priority_prediction"}}
-        """
-        response_text = query_openai(prompt, full_query)
-        priority_result = json.loads(response_text)
-        return priority_result
-    except json.JSONDecodeError as e:
-        st.error(f"Error decoding JSON from OpenAI response: {e}")
-        st.text(f"Raw OpenAI response: {response_text}")
-        return None
-    except Exception as e:
-        st.error(f"An unexpected error occurred during priority prediction: {e}")
-        return None
+    return run_json_task(prompt, full_query, "priority prediction")
+
 
 def generate_response(response_prompt, query, category, metadata_tags, priority):
-    """
-    Generates a draft response for a support ticket using the OpenAI model.
-    Args:
-        response_prompt (str): The prompt for generating the response.
-        query (str): The original support ticket text.
-        category (str): The predicted category of the ticket.
-        metadata_tags (dict): The extracted metadata tags (Device, Problem Type, User Impact).
-        priority (str): The predicted priority of the ticket.
-    Returns:
-        str: The generated response text, or None if response generation fails.
-    """
-    # Combine the inputs into a single message for the model
     user_message = f"""
     Support Ticket: {query}
     Category: {category}
     Metadata Tags: {metadata_tags}
     Priority: {priority}
     """
-
     try:
-        # Pass the combined message to the query_openai function
-        response_text = query_openai(response_prompt, user_message)
-        return response_text
+        return query_llm(response_prompt, user_message)
     except Exception as e:
         st.error(f"An unexpected error occurred during response generation: {e}")
         return None
 
-# Define the prompts
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
 classification_prompt = """
  You are a technical assistant. Classify the support ticket based on the Support Ticket Text presented in the input into the following categories and not any other.
       - Technical issues
@@ -176,7 +224,7 @@ Output: {"Device": "Router", "Problem Type": "Lost Internet", "User Impact": "Mo
 Return the final output only in a valid JSON format without any additional explanation.
 """
 
-priority_prompt ="""
+priority_prompt = """
 You are an intelligent assistant that determines the priority level of a support ticket.
 For any given ticket, follow this step-by-step reasoning process to assign the correct priority level: Low, Medium, High.
 Step-by-step Evaluation:
@@ -210,46 +258,56 @@ Ensure the final response:
 Return only the final response to the customer. Do not include your reasoning steps in the output.
 """
 
-
+# ---------------------------------------------------------------------------
 # Streamlit App
+# ---------------------------------------------------------------------------
 st.title("Support Ticket Categorization System")
+st.caption(f"Using **{provider}** · `{cfg['base_url']}` · model `{model_name}`")
 
 st.write("Enter the support ticket text below:")
-
 support_ticket_input = st.text_area("Support Ticket Text", height=200)
 
 if st.button("Process Ticket"):
-    if support_ticket_input:
-        st.write("Processing...")
+    if not api_key:
+        st.error(
+            f"No API key found for {provider}. Enter one in the sidebar "
+            f"or set {cfg['env_var']} in your .env file, then try again."
+        )
+    elif not support_ticket_input:
+        st.warning("Please enter support ticket text to process.")
+    else:
+        with st.spinner("Processing..."):
+            # Categorization
+            category_result = classify_ticket(classification_prompt, support_ticket_input)
+            category = category_result.get("Category") if category_result else "N/A"
 
-        # Categorization
-        category_result = classify_ticket(classification_prompt, support_ticket_input)
-        category = category_result.get('Category') if category_result else "N/A"
+            # Metadata Extraction
+            metadata_result = extract_metadata(metadata_prompt, support_ticket_input)
+            device = metadata_result.get("Device") if metadata_result else "N/A"
+            problem_type = metadata_result.get("Problem Type") if metadata_result else "N/A"
+            user_impact = metadata_result.get("User Impact") if metadata_result else "N/A"
+
+            # Priority Prediction
+            priority_result = predict_priority(
+                priority_prompt, support_ticket_input, problem_type, user_impact
+            )
+            priority = priority_result.get("priority") if priority_result else "N/A"
+
+            # Draft Response Generation
+            draft_response = generate_response(
+                response_prompt, support_ticket_input, category, metadata_result, priority
+            )
+
         st.subheader("Category:")
         st.write(category)
-
-        # Metadata Extraction
-        metadata_result = extract_metadata(metadata_prompt, support_ticket_input)
-        device = metadata_result.get('Device') if metadata_result else "N/A"
-        problem_type = metadata_result.get('Problem Type') if metadata_result else "N/A"
-        user_impact = metadata_result.get('User Impact') if metadata_result else "N/A"
 
         st.subheader("Metadata:")
         st.write(f"Device: {device}")
         st.write(f"Problem Type: {problem_type}")
         st.write(f"User Impact: {user_impact}")
 
-        # Priority Prediction
-        priority_result = predict_priority(priority_prompt, support_ticket_input, problem_type, user_impact)
-        priority = priority_result.get('priority') if priority_result else "N/A"
         st.subheader("Priority:")
         st.write(priority)
 
-        # Draft Response Generation
-        draft_response = generate_response(response_prompt, support_ticket_input, category, metadata_result, priority)
         st.subheader("Draft Response:")
         st.write(draft_response)
-
-
-    else:
-        st.warning("Please enter support ticket text to process.")
